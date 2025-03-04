@@ -1,4 +1,5 @@
 import asyncio
+import socket
 import struct
 import re
 
@@ -18,12 +19,21 @@ VITA_PORT = 4991
 
 UsingAddress = None
 Local2FlexAddress = None
+VitaReceiver = None
+LogTemp = False
 
 def print_info(*args):
+    global LogTemp
+    if LogTemp:
+        print()
+        LogTemp = False
+
     print(*args)
 
 def print_temp(*args):
+    global LogTemp
     print(*args, end='\r')
+    LogTemp = True
 
 class UDPProtocol(asyncio.DatagramProtocol):
     def __init__(self, loop, handle_packet):
@@ -159,23 +169,21 @@ async def handle_tcp_client(reader, writer):
                             message = message[:idx+1] + ' '.join([k[0] + k[1] for k in kvs]) + '\n'
                             writer.write(message.encode())
                             continue
-            elif message[0] == 'R':
-                if match := re.match(r"R(\d+)\|([0-9A-F]+)\|(.*)", message):
-                    reply_id, reply_code, reply_str = match.groups()
-                    reply = reply_table.get(reply_id)
-                    if reply:
-                        del reply_table[reply_id]
-                    if reply == 1:
-                        global Local2FlexAddress 
-                        Local2FlexAddress = reply_str
-                        message = f"R{reply_id}|{reply_code}|{client_ip}\n"
-                        writer.write(message.encode())
-                        continue
-            elif message[0] == 'M':
-                if match := re.match(r"M(\d+)\|Client connected from IP ", message):
-                    message = f"M{match.group(1)}|Client connected from IP {client_ip}\n"
+            elif match := re.match(r"R(\d+)\|([0-9A-F]+)\|(.*)", message):
+                reply_id, reply_code, reply_str = match.groups()
+                reply = reply_table.get(reply_id)
+                if reply:
+                    del reply_table[reply_id]
+                if reply == 1:
+                    global Local2FlexAddress 
+                    Local2FlexAddress = reply_str
+                    message = f"R{reply_id}|{reply_code}|{client_ip}\n"
                     writer.write(message.encode())
                     continue
+            elif match := re.match(r"M(\d+)\|Client connected from IP ", message):
+                message = f"M{match.group(1)}|Client connected from IP {client_ip}\n"
+                writer.write(message.encode())
+                continue
 
             writer.write(data)
                             
@@ -191,7 +199,6 @@ async def handle_tcp_client(reader, writer):
     flex_writer.close()
     writer.close()
 
-VitaReceiver = None
 
 async def init_vita_forwarding(loop):
     global VitaReceiver
@@ -213,8 +220,8 @@ async def setup_udp_forwarding(loop, client_ip, client_vita_port):
     
     transport, protocol = await loop.create_datagram_endpoint(
         lambda: UDPProtocol(loop, forward_udp_packet),
-        local_addr=(Local2FlexAddress or '0.0.0.0', 0),
-        # local_addr=('0.0.0.0', client_vita_port),
+        local_addr=(Local2FlexAddress or '', 0),
+        # local_addr=('', client_vita_port),
     )
     
     setup_udp_forwarding.transport[(client_ip, client_vita_port)] = transport
@@ -277,9 +284,12 @@ async def setup_tcp_forwarding(loop, port):
 async def main():
     loop = asyncio.get_running_loop()
 
-    transport, protocol = await loop.create_datagram_endpoint(
+    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    udp_socket.bind(('', DISCOVERY_PORT))
+    udp_discovery, protocol = await loop.create_datagram_endpoint(
         lambda: UDPProtocol(loop, handle_discovery_packet),
-        local_addr=('0.0.0.0', DISCOVERY_PORT)
+        sock=udp_socket,
     )
 
     tcp_command_server = await asyncio.start_server(handle_tcp_client, NEW_IP, NEW_COMMAND_PORT)
@@ -287,17 +297,17 @@ async def main():
     await init_vita_forwarding(loop)
     await tcp_command_server.start_serving()
     await tcp_file_server.start_serving()
-    return transport, tcp_command_server, tcp_file_server
+    return udp_discovery, tcp_command_server, tcp_file_server
 
 if __name__ == "__main__":
     loop = asyncio.new_event_loop()
-    transport, tcp_command_server, tcp_file_server = loop.run_until_complete(main())
+    udp_discovery, tcp_command_server, tcp_file_server = loop.run_until_complete(main())
     try:
         loop.run_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        transport.close()
+        udp_discovery.close()
         tcp_command_server.close()
         tcp_file_server.close()
         VitaReceiver.close()
